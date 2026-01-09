@@ -4,10 +4,9 @@
 # 2. prime login
 # 3. prime env install will/wordle (or any owner/environment)
 #
-import asyncio
 import os
 import time
-from typing import Dict, List, Optional, Tuple, TypedDict, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import verifiers as vf
 from tqdm.asyncio import tqdm_asyncio
@@ -18,6 +17,7 @@ from atroposlib.envs.base import (
     BaseEnvConfig,
     ScoredDataGroup,
 )
+from atroposlib.utils.tokenize_for_trainer import tokenize_for_trainer
 
 
 class VfEnvConfig(BaseEnvConfig):
@@ -26,6 +26,9 @@ class VfEnvConfig(BaseEnvConfig):
 
 
 class VerifiersEnv(BaseEnv):
+
+    name = "verifiers"
+
     def __init__(
         self,
         config: VfEnvConfig,
@@ -35,6 +38,7 @@ class VerifiersEnv(BaseEnv):
     ):
         super().__init__(config, server_configs, slurm, testing)
         self.eval_metrics = list()
+        self.percent_correct_buffer = list()
 
         self.vf_env = vf.load_environment(config.vf_env_name, **config.env_args)
         self.rubric = self.vf_env.rubric
@@ -67,6 +71,27 @@ class VerifiersEnv(BaseEnv):
             ),
         ]
         return env_config, server_configs
+
+    async def wandb_log(self, wandb_metrics: Optional[Dict] = None):
+        """Log metrics to W&B."""
+        if wandb_metrics is None:
+            wandb_metrics = {}
+
+        # Try to calculate percent_correct, pass if there's a division by zero
+        try:
+            wandb_metrics["train/percent_correct"] = sum(
+                self.percent_correct_buffer
+            ) / len(self.percent_correct_buffer)
+        except ZeroDivisionError:
+            # Skip if buffer is empty
+            pass
+
+        self.percent_correct_buffer = list()
+        for item in self.eval_metrics:
+            wandb_metrics[item[0]] = item[1]
+        self.eval_metrics = list()
+        # Call the parent method to handle the server metrics
+        await super().wandb_log(wandb_metrics)
 
     async def setup(self):
         self.train = self.vf_env.get_dataset()
@@ -179,8 +204,66 @@ class VerifiersEnv(BaseEnv):
         self.iter += 1
         return next_item
 
+    async def score(
+        self, rollout_group_data
+    ) -> Union[Optional[ScoredDataGroup], List[Optional[ScoredDataGroup]]]:
+        """Score rollouts using the verifiers rubric and reward functions."""
+        scores = ScoredDataGroup()
+        scores["tokens"] = list()
+        scores["masks"] = list()
+        scores["scores"] = list()
+        scores["prompts"] = list()
+        scores["logprobs"] = list()
+
+        for item in rollout_group_data:
+            question = item.get("question", "")
+            answer = item.get("answer", "")
+            state = item.get("state")
+            info = item.get("info")
+            messages = item.get("messages", [])
+
+            # Calculate rewards using all reward functions
+            # Note: The rubric functions receive the full message history
+            rewards = []
+            for func in self.reward_funcs:
+                reward = await self.rubric.call_reward_func(
+                    func=func,
+                    prompt=question,
+                    completion=messages,
+                    answer=answer,
+                    info=info,
+                    state=state,
+                )
+                rewards.append(reward)
+
+            # Apply weighted rewards
+            weighted_rewards = [
+                reward * scale for reward, scale in zip(rewards, self.reward_scales)
+            ]
+            final_score = sum(weighted_rewards)
+
+            # Track correctness for training metrics
+            if hasattr(self, "percent_correct_buffer"):
+                self.percent_correct_buffer.append(int(final_score > 0))
+
+            # Tokenize for trainer
+            tokens, masks = tokenize_for_trainer(
+                messages=messages,
+                tokenizer=self.tokenizer,
+                max_token_length=self.config.max_token_length,
+            )
+
+            scores["tokens"].append(tokens)
+            scores["masks"].append(masks)
+            scores["scores"].append(final_score)
+            scores["prompts"].append(question)
+            scores["logprobs"].append([])
+
+        return scores
+
 
 async def main():
+    """Example usage of the VerifiersEnv."""
     env_config, server_configs = VerifiersEnv.config_init()
     env_config.vf_env_name = "wordle"
     env_config.env_args = {}
@@ -194,12 +277,13 @@ async def main():
 
     item = await env.get_next_item()
 
-    roll = await env.rollout_and_score_eval(
+    result = await env.rollout_and_score_eval(
         question=item["question"],
         answer=item["answer"],
         system_prompt=env.system_prompt,
     )
 
+    print(f"Sample result score: {result['score']}")
     print("Starting evaluate")
 
     metrics = await env.evaluate()
@@ -208,5 +292,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    # VerifiersEnv.cli()
-    asyncio.run(main())
+    VerifiersEnv.cli()
